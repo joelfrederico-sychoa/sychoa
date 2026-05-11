@@ -2,6 +2,30 @@
 
 A common location for public files.
 
+## PDF address box app
+
+Install the local Qt app:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip uninstall -y sychoa sychoa-pdf-boxes
+python3 -m pip install .
+```
+
+Run it:
+
+```bash
+sychoa
+```
+
+Use a regular CPython environment. The existing `venv314t` free-threaded Python
+environment cannot install PyMuPDF.
+
+The app opens a main PDF, lets you create a separate set of thick red highlight
+boxes for each address, saves the PDF and box data as JSON, reloads that JSON
+later, and exports one marked-up PDF per address.
+
 - [1267](site-layouts/1267%20(Layout%20B).pdf)
 - [1269](site-layouts/1269%20(Layout%20C).pdf)
 - [1271](site-layouts/1271%20(Layout%20C).pdf)

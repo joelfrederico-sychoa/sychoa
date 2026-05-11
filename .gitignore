@@ -1,11 +1,19 @@
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+*.ipynb
 
+# Venv
 .venv/
 venv/
 venv*/
 
+# MacOS
 .DS_Store
 build/
 dist/
-*.egg-info/
+
+# Misc
+*.pdf
+*.csv

@@ -532,6 +532,7 @@ class MainWindow(QMainWindow):
         self.thumbnail_list.setIconSize(QSize(THUMBNAIL_WIDTH, int(THUMBNAIL_WIDTH * 1.4)))
         self.thumbnail_list.setSpacing(8)
         self.thumbnail_list.setUniformItemSizes(False)
+        self.thumbnail_list.currentRowChanged.connect(self.on_thumbnail_changed)
         self.thumbnail_list.itemClicked.connect(self.on_thumbnail_clicked)
         thumbnail_layout.addWidget(self.thumbnail_list)
 
@@ -1251,7 +1252,11 @@ class MainWindow(QMainWindow):
     def on_thumbnail_clicked(self, item: QListWidgetItem) -> None:
         if not self.pdf_doc:
             return
-        page_index = int(item.data(Qt.ItemDataRole.UserRole))
+        self.on_thumbnail_changed(int(item.data(Qt.ItemDataRole.UserRole)))
+
+    def on_thumbnail_changed(self, page_index: int) -> None:
+        if not self.pdf_doc or page_index < 0:
+            return
         if page_index != self.current_page:
             self.current_page = page_index
             self.render_current_page()

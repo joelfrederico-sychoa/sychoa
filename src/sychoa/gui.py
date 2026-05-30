@@ -46,7 +46,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-
 from .models import ADDRESS_TYPES, AddressRecord, BoxRecord, normalize_address_type
 from .pdf_export import HIGHLIGHT_WIDTH, MIN_BOX_SIZE, export_address_pdfs
 from .project_json import (
@@ -1250,8 +1249,6 @@ class MainWindow(QMainWindow):
         self.thumbnail_list.setCurrentRow(self.current_page)
 
     def on_thumbnail_clicked(self, item: QListWidgetItem) -> None:
-        if not self.pdf_doc:
-            return
         self.on_thumbnail_changed(int(item.data(Qt.ItemDataRole.UserRole)))
 
     def on_thumbnail_changed(self, page_index: int) -> None:
@@ -1259,11 +1256,6 @@ class MainWindow(QMainWindow):
             return
         if page_index != self.current_page:
             self.current_page = page_index
-            self.render_current_page()
-
-    def first_page(self) -> None:
-        if self.pdf_doc and self.current_page != 0:
-            self.current_page = 0
             self.render_current_page()
 
     def previous_page(self) -> None:
@@ -1274,11 +1266,6 @@ class MainWindow(QMainWindow):
     def next_page(self) -> None:
         if self.pdf_doc and self.current_page < self.pdf_doc.page_count - 1:
             self.current_page += 1
-            self.render_current_page()
-
-    def last_page(self) -> None:
-        if self.pdf_doc and self.current_page != self.pdf_doc.page_count - 1:
-            self.current_page = self.pdf_doc.page_count - 1
             self.render_current_page()
 
     def go_to_spin_page(self, value: int) -> None:
@@ -1313,21 +1300,6 @@ class MainWindow(QMainWindow):
         self.autosave_project()
         self.close_pdfs()
         event.accept()
-
-
-def address_color(index: int) -> QColor:
-    colors = [
-        "#2563eb",
-        "#dc2626",
-        "#059669",
-        "#d97706",
-        "#7c3aed",
-        "#0891b2",
-        "#be123c",
-        "#4d7c0f",
-    ]
-    return QColor(colors[index % len(colors)])
-
 
 def bounded_point(point: QPointF, bounds: QRectF) -> QPointF:
     return QPointF(

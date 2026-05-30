@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "sychoa"
 version = "0.1.0"
-description = "Qt app for marking address-specific highlight boxes on a PDF and exporting marked-up PDFs."
+description = "Qt app for marking address-specific highlight boxes across one or more PDFs and exporting marked-up PDFs."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

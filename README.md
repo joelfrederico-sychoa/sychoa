@@ -18,6 +18,9 @@ Run it:
 sychoa
 ```
 
-The app opens a main PDF, lets you create a separate set of thick red highlight
-boxes for each address, saves the PDF and box data as JSON, reloads that JSON
-later, and exports one marked-up PDF per address.
+The app opens one or more main PDFs, lets you create a separate set of thick red
+highlight boxes for each address, saves the PDF and box data as JSON, reloads
+that JSON later, and exports one marked-up PDF per address.
+
+Global extra pages are applied to every address, and type-specific extra pages
+are applied to every address of that type.

@@ -24,3 +24,11 @@ that JSON later, and exports one marked-up PDF per address.
 
 Global extra pages are applied to every address, and type-specific extra pages
 are applied to every address of that type.
+
+Use **Replace PDF** when a source PDF has been revised. The app keeps the
+existing PDF id, matches old pages to new pages by extracted page text, scales
+box coordinates to the new page size, remaps global/type page references, and
+reports low-confidence page matches for review.
+
+Use **Undo** or `Cmd+Z`/`Ctrl+Z` to reverse project edits such as box changes,
+address changes, extra page changes, added/replaced PDFs, and remapped boxes.

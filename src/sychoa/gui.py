@@ -14,7 +14,7 @@ except ImportError as exc:  # pragma: no cover - exercised by users without deps
     ) from exc
 
 from PySide6.QtCore import QPointF, QRectF, QSettings, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPen, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QFontMetrics, QIcon, QImage, QKeySequence, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsScene,
+    QGraphicsSimpleTextItem,
     QGraphicsView,
     QHBoxLayout,
     QInputDialog,
@@ -48,6 +49,7 @@ from PySide6.QtWidgets import (
 
 from .models import ADDRESS_TYPES, AddressRecord, BoxRecord, normalize_address_type
 from .pdf_export import HIGHLIGHT_WIDTH, MIN_BOX_SIZE, export_address_pdfs
+from .pdf_remap import remap_pdf_references
 from .project_json import (
     addresses_from_json,
     extra_pages_from_json,
@@ -65,6 +67,8 @@ from .project_json import (
 RENDER_SCALE = 2.0
 HIGHLIGHT_COLOR = "#ff0000"
 HANDLE_SIZE = 14.0
+BOX_LABEL_MAX_WIDTH = 180
+BOX_LABEL_PADDING = 3.0
 THUMBNAIL_WIDTH = 150
 SETTINGS_ORG = "sychoa"
 SETTINGS_APP = "PDF Address Box Builder"
@@ -78,21 +82,39 @@ class LoadedPdf:
     doc: fitz.Document
 
 
+@dataclass
+class UndoSnapshot:
+    label: str
+    pdf_records: list[tuple[str, Path]]
+    addresses: list[dict]
+    extra_pages: dict[str, list[int]]
+    type_extra_pages: dict[str, dict[str, list[int]]]
+    current_pdf_id: str
+    current_page: int
+    selected_address_id: str | None
+    project_path: Path | None
+    working_dir: Path
+    created_at: str
+
+
 class EditableBoxItem(QGraphicsRectItem):
     def __init__(
         self,
         box: BoxRecord,
         page_rect: QRectF,
         pen: QPen,
+        on_change_started: Callable[[BoxRecord], None],
         on_changed: Callable[[], None],
     ) -> None:
         super().__init__(box.rect)
         self.box = box
         self.page_rect = page_rect
+        self.on_change_started = on_change_started
         self.on_changed = on_changed
         self.drag_mode: str | None = None
         self.drag_start = QPointF()
         self.original_rect = QRectF()
+        self.change_started = False
 
         self.setPen(pen)
         self.setAcceptHoverEvents(True)
@@ -151,6 +173,7 @@ class EditableBoxItem(QGraphicsRectItem):
         self.drag_mode = self.handle_at(event.pos()) or "move"
         self.drag_start = event.scenePos()
         self.original_rect = QRectF(self.rect())
+        self.change_started = False
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: ANN001, N802 - Qt override
@@ -165,6 +188,9 @@ class EditableBoxItem(QGraphicsRectItem):
             new_rect = self.resized_rect(self.drag_mode, event.scenePos())
 
         if new_rect.width() >= MIN_BOX_SIZE and new_rect.height() >= MIN_BOX_SIZE:
+            if not self.change_started and new_rect != self.rect():
+                self.on_change_started(self.box)
+                self.change_started = True
             self.prepareGeometryChange()
             self.setRect(new_rect)
             self.sync_box_record()
@@ -173,7 +199,8 @@ class EditableBoxItem(QGraphicsRectItem):
     def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001, N802 - Qt override
         self.drag_mode = None
         self.sync_box_record()
-        self.on_changed()
+        if self.change_started:
+            self.on_changed()
         event.accept()
 
     def clamped_move(self, rect: QRectF) -> QRectF:
@@ -211,9 +238,15 @@ class EditableBoxItem(QGraphicsRectItem):
 
 
 class PdfCanvas(QGraphicsView):
-    def __init__(self, on_box_created: Callable[[QRectF], None], on_box_changed: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        on_box_created: Callable[[QRectF], None],
+        on_box_change_started: Callable[[BoxRecord], None],
+        on_box_changed: Callable[[], None],
+    ) -> None:
         super().__init__()
         self.on_box_created = on_box_created
+        self.on_box_change_started = on_box_change_started
         self.on_box_changed = on_box_changed
         self.scene = QGraphicsScene(self)
         self.setScene(self.scene)
@@ -260,12 +293,50 @@ class PdfCanvas(QGraphicsView):
                 if box.pdf_id != current_pdf_id or box.page != self.current_page:
                     continue
                 if is_selected:
-                    rect_item = EditableBoxItem(box, self.page_rect, pen, self.on_box_changed)
+                    rect_item = EditableBoxItem(box, self.page_rect, pen, self.on_box_change_started, self.on_box_changed)
                     self.scene.addItem(rect_item)
                 else:
                     rect_item = self.scene.addRect(box.rect, pen)
                 rect_item.setZValue(5 if is_selected else 1)
+                if show_all:
+                    self.add_box_label(address.label, box.rect, is_selected)
         self.apply_zoom()
+
+    def add_box_label(self, label: str, box_rect: QRectF, is_selected: bool) -> None:
+        font = QFont()
+        font.setPointSize(8)
+        font.setBold(is_selected)
+        metrics = QFontMetrics(font)
+        available_width = max(40, min(BOX_LABEL_MAX_WIDTH, int(box_rect.width()) - 6))
+        label_text = metrics.elidedText(label, Qt.TextElideMode.ElideRight, available_width)
+
+        text_item = QGraphicsSimpleTextItem(label_text)
+        text_item.setFont(font)
+        text_item.setBrush(QBrush(QColor("#ffffff")))
+        text_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+        text_rect = text_item.boundingRect()
+        label_width = text_rect.width() + (BOX_LABEL_PADDING * 2.0)
+        label_height = text_rect.height() + (BOX_LABEL_PADDING * 2.0)
+        label_x = min(
+            max(box_rect.left(), self.page_rect.left()),
+            max(self.page_rect.left(), self.page_rect.right() - label_width),
+        )
+        label_y = box_rect.top() - label_height - 2.0
+        if label_y < self.page_rect.top():
+            label_y = min(box_rect.top() + 2.0, self.page_rect.bottom() - label_height)
+
+        background = self.scene.addRect(
+            QRectF(label_x, label_y, label_width, label_height),
+            QPen(Qt.PenStyle.NoPen),
+            QBrush(QColor(17, 24, 39, 215)),
+        )
+        background.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        background.setZValue(8 if is_selected else 4)
+
+        text_item.setPos(label_x + BOX_LABEL_PADDING, label_y + BOX_LABEL_PADDING)
+        text_item.setZValue(9 if is_selected else 5)
+        self.scene.addItem(text_item)
 
     @property
     def current_page(self) -> int:
@@ -337,8 +408,11 @@ class MainWindow(QMainWindow):
         self.show_all_addresses = False
         self.page_image_cache: dict[tuple[str, int, float], QImage] = {}
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self.undo_stack: list[UndoSnapshot] = []
+        self.max_undo_states = 100
+        self.restoring_undo = False
 
-        self.canvas = PdfCanvas(self.add_box_from_rect, self.on_box_changed)
+        self.canvas = PdfCanvas(self.add_box_from_rect, self.on_box_change_started, self.on_box_changed)
         self.build_ui()
         self.update_actions()
         QTimer.singleShot(0, self.load_last_project)
@@ -374,6 +448,10 @@ class MainWindow(QMainWindow):
         add_pdf_action.triggered.connect(self.add_pdf_dialog)
         toolbar.addAction(add_pdf_action)
 
+        replace_pdf_action = QAction("Replace PDF", self)
+        replace_pdf_action.triggered.connect(self.replace_pdf_dialog)
+        toolbar.addAction(replace_pdf_action)
+
         load_action = QAction("Load JSON", self)
         load_action.triggered.connect(self.load_project_dialog)
         toolbar.addAction(load_action)
@@ -387,8 +465,15 @@ class MainWindow(QMainWindow):
         export_action.triggered.connect(self.export_pdfs_dialog)
         toolbar.addAction(export_action)
 
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        undo_action.triggered.connect(self.undo)
+        toolbar.addAction(undo_action)
+
         self.save_action = save_action
         self.export_action = export_action
+        self.replace_pdf_action = replace_pdf_action
+        self.undo_action = undo_action
 
         side_panel = QWidget()
         side_layout = QVBoxLayout(side_panel)
@@ -560,13 +645,108 @@ class MainWindow(QMainWindow):
         if paths:
             if self.addresses and not confirm(self, "Open PDF", "Opening a new PDF clears the current addresses and boxes."):
                 return
+            self.push_undo_state("Open PDFs")
             self.load_pdfs([{"path": Path(path)} for path in paths], clear_project=True, create_default_project=True)
 
     def add_pdf_dialog(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Add PDFs", str(self.working_dir), "PDF files (*.pdf)")
         if paths:
+            self.push_undo_state("Add PDF")
             self.load_pdfs([{"path": Path(path)} for path in paths], clear_project=False)
             self.autosave_project()
+
+    def replace_pdf_dialog(self) -> None:
+        current_pdf = self.current_pdf
+        if not current_pdf:
+            QMessageBox.warning(self, "No PDF", "Select a PDF before replacing it.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Replace {current_pdf.path.name}",
+            str(current_pdf.path.parent),
+            "PDF files (*.pdf)",
+        )
+        if not path:
+            return
+        new_path = Path(path).expanduser().resolve()
+        if not confirm(
+            self,
+            "Replace PDF",
+            f"Replace {current_pdf.path.name} with {new_path.name} and remap existing boxes?",
+        ):
+            return
+
+        try:
+            new_doc = fitz.open(new_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not open PDF", f"{new_path}\n\n{exc}")
+            return
+        if new_doc.page_count == 0:
+            new_doc.close()
+            QMessageBox.warning(self, "Empty PDF", "Choose a PDF with at least one page.")
+            return
+
+        self.push_undo_state("Replace PDF")
+        old_page = self.current_page
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = remap_pdf_references(
+                self.addresses,
+                self.extra_pages,
+                self.type_extra_pages,
+                current_pdf.id,
+                current_pdf.doc,
+                new_doc,
+            )
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            new_doc.close()
+            QMessageBox.critical(self, "Could not remap PDF", str(exc))
+            return
+        QApplication.restoreOverrideCursor()
+
+        mapped_current_page = result.page_map.get(old_page, min(old_page, max(new_doc.page_count - 1, 0)))
+        current_pdf.doc.close()
+        self.pdfs[self.current_pdf_index] = LoadedPdf(id=current_pdf.id, path=new_path, doc=new_doc)
+        self.current_page = mapped_current_page
+        self.working_dir = new_path.parent
+        self.page_image_cache.clear()
+        self.refresh_pdf_list()
+        self.refresh_after_pdf_replacement()
+        self.autosave_project()
+        self.show_remap_summary(current_pdf.path.name, new_path.name, result)
+
+    def refresh_after_pdf_replacement(self) -> None:
+        doc = self.pdf_doc
+        if not doc:
+            self.refresh_pdf_page_state()
+            return
+        self.current_page = max(0, min(self.current_page, doc.page_count - 1))
+        self.page_spin.blockSignals(True)
+        self.page_spin.setMaximum(max(1, doc.page_count))
+        self.page_spin.setValue(self.current_page + 1)
+        self.page_spin.blockSignals(False)
+        self.page_total_label.setText(f"of {doc.page_count}")
+        self.refresh_thumbnails()
+        self.refresh_type_page_list()
+        self.refresh_address_list()
+        self.render_current_page()
+
+    def show_remap_summary(self, old_name: str, new_name: str, result) -> None:  # noqa: ANN001
+        review_pages = sorted(set(result.low_confidence_pages + result.fallback_pages))
+        message = (
+            f"Replaced {old_name} with {new_name}.\n\n"
+            f"Remapped {result.boxes_remapped} box(es), "
+            f"{result.extra_pages_remapped} global page reference(s), and "
+            f"{result.type_pages_remapped} type page reference(s)."
+        )
+        if review_pages:
+            pages = ", ".join(str(page + 1) for page in review_pages[:12])
+            if len(review_pages) > 12:
+                pages += f", plus {len(review_pages) - 12} more"
+            message += f"\n\nReview these old page mappings: {pages}."
+        self.statusBar().showMessage(f"Replaced PDF and remapped {result.boxes_remapped} box(es)", 6000)
+        QMessageBox.information(self, "PDF replaced", message)
 
     def load_pdfs(
         self,
@@ -739,6 +919,8 @@ class MainWindow(QMainWindow):
             if self.addresses:
                 self.address_list.setCurrentRow(0)
             self.render_current_page()
+            self.undo_stack.clear()
+            self.update_actions()
             self.remember_project_path(path)
             self.statusBar().showMessage(f"Loaded {path.name}", 4000)
         except Exception as exc:
@@ -805,6 +987,130 @@ class MainWindow(QMainWindow):
             self.type_extra_pages,
         )
 
+    def make_undo_snapshot(self, label: str) -> UndoSnapshot:
+        return UndoSnapshot(
+            label=label,
+            pdf_records=[(pdf_source.id, pdf_source.path) for pdf_source in self.pdfs],
+            addresses=[address.to_json() for address in self.addresses],
+            extra_pages={pdf_id: list(pages) for pdf_id, pages in self.extra_pages.items()},
+            type_extra_pages={
+                address_type: {pdf_id: list(pages) for pdf_id, pages in pages_by_pdf.items()}
+                for address_type, pages_by_pdf in self.type_extra_pages.items()
+            },
+            current_pdf_id=self.current_pdf_id,
+            current_page=self.current_page,
+            selected_address_id=self.selected_address().id if self.selected_address() else None,
+            project_path=self.project_path,
+            working_dir=self.working_dir,
+            created_at=self.created_at,
+        )
+
+    def push_undo_state(self, label: str) -> None:
+        if self.restoring_undo:
+            return
+        self.undo_stack.append(self.make_undo_snapshot(label))
+        if len(self.undo_stack) > self.max_undo_states:
+            del self.undo_stack[: len(self.undo_stack) - self.max_undo_states]
+        self.update_actions()
+
+    def undo(self) -> None:
+        if not self.undo_stack:
+            return
+        snapshot = self.undo_stack.pop()
+        self.restoring_undo = True
+        try:
+            if not self.restore_undo_snapshot(snapshot):
+                self.undo_stack.append(snapshot)
+                return
+            self.autosave_project()
+            self.statusBar().showMessage(f"Undid {snapshot.label}", 4000)
+        finally:
+            self.restoring_undo = False
+            self.update_actions()
+
+    def restore_undo_snapshot(self, snapshot: UndoSnapshot) -> bool:
+        if not self.restore_snapshot_pdfs(snapshot):
+            return False
+        self.addresses = [AddressRecord.from_json(item) for item in snapshot.addresses]
+        self.extra_pages = {pdf_id: list(pages) for pdf_id, pages in snapshot.extra_pages.items()}
+        self.type_extra_pages = {
+            address_type: {pdf_id: list(pages) for pdf_id, pages in pages_by_pdf.items()}
+            for address_type, pages_by_pdf in snapshot.type_extra_pages.items()
+        }
+        self.project_path = snapshot.project_path
+        self.working_dir = snapshot.working_dir
+        self.created_at = snapshot.created_at
+        self.current_pdf_index = next(
+            (index for index, pdf_source in enumerate(self.pdfs) if pdf_source.id == snapshot.current_pdf_id),
+            0,
+        )
+        self.current_page = snapshot.current_page
+        self.refresh_after_state_restore(snapshot.selected_address_id)
+        return True
+
+    def restore_snapshot_pdfs(self, snapshot: UndoSnapshot) -> bool:
+        current_records = [(pdf_source.id, pdf_source.path) for pdf_source in self.pdfs]
+        if current_records == snapshot.pdf_records:
+            return True
+
+        loaded: list[LoadedPdf] = []
+        try:
+            for pdf_id, path in snapshot.pdf_records:
+                loaded.append(LoadedPdf(id=pdf_id, path=path, doc=fitz.open(path)))
+        except Exception as exc:
+            for pdf_source in loaded:
+                pdf_source.doc.close()
+            QMessageBox.critical(self, "Could not undo", f"Could not reopen a previous PDF.\n\n{exc}")
+            return False
+
+        self.close_pdfs()
+        self.pdfs = loaded
+        return True
+
+    def refresh_after_state_restore(self, selected_address_id: str | None) -> None:
+        self.page_image_cache.clear()
+        if self.pdfs:
+            self.current_pdf_index = max(0, min(self.current_pdf_index, len(self.pdfs) - 1))
+            doc = self.pdfs[self.current_pdf_index].doc
+            self.current_page = max(0, min(self.current_page, doc.page_count - 1))
+        else:
+            self.current_pdf_index = 0
+            self.current_page = 0
+        target_pdf_index = self.current_pdf_index
+        target_page = self.current_page
+        self.refresh_pdf_list()
+        self.current_pdf_index = target_pdf_index
+        self.current_page = target_page
+        self.pdf_list.blockSignals(True)
+        self.pdf_list.setCurrentRow(self.current_pdf_index if self.pdfs else -1)
+        self.pdf_list.blockSignals(False)
+        if self.pdf_doc:
+            self.page_spin.blockSignals(True)
+            self.page_spin.setMaximum(max(1, self.pdf_doc.page_count))
+            self.page_spin.setValue(self.current_page + 1)
+            self.page_spin.blockSignals(False)
+            self.page_total_label.setText(f"of {self.pdf_doc.page_count}")
+            self.refresh_thumbnails_for_restore()
+        else:
+            self.page_spin.setEnabled(False)
+            self.page_total_label.setText("of 0")
+            self.thumbnail_list.clear()
+            self.canvas.scene.clear()
+            self.pdf_label.setText("No PDF loaded")
+        self.refresh_type_page_list()
+        self.refresh_address_list()
+        if selected_address_id:
+            self.set_selected_address(selected_address_id)
+        self.render_current_page()
+
+    def refresh_thumbnails_for_restore(self) -> None:
+        self.thumbnail_list.blockSignals(True)
+        try:
+            self.refresh_thumbnails()
+            self.thumbnail_list.setCurrentRow(self.current_page)
+        finally:
+            self.thumbnail_list.blockSignals(False)
+
     def export_pdfs_dialog(self) -> None:
         if not self.pdf_doc or not self.pdf_path:
             QMessageBox.warning(self, "No PDF", "Open a PDF before exporting.")
@@ -861,6 +1167,7 @@ class MainWindow(QMainWindow):
         label = label.strip()
         if not ok or not label:
             return
+        self.push_undo_state("Add address")
         address = AddressRecord(label=label, address_type=self.address_type_combo.currentText())
         self.addresses.append(address)
         self.refresh_address_list()
@@ -877,6 +1184,7 @@ class MainWindow(QMainWindow):
         label = label.strip()
         if not ok or not label:
             return
+        self.push_undo_state("Duplicate address")
         duplicated = AddressRecord(
             label=label,
             address_type=source.address_type,
@@ -905,6 +1213,7 @@ class MainWindow(QMainWindow):
         label, ok = QInputDialog.getText(self, "Rename address", "Address:", text=address.label)
         label = label.strip()
         if ok and label:
+            self.push_undo_state("Rename address")
             address.label = label
             self.refresh_address_list()
             self.render_current_page()
@@ -916,6 +1225,7 @@ class MainWindow(QMainWindow):
             return
         if not confirm(self, "Delete address", f"Delete {address.label} and its boxes?"):
             return
+        self.push_undo_state("Delete address")
         self.addresses = [item for item in self.addresses if item.id != address.id]
         self.refresh_address_list()
         self.render_current_page()
@@ -926,6 +1236,7 @@ class MainWindow(QMainWindow):
         if not address:
             QMessageBox.warning(self, "No address", "Add or select an address before drawing boxes.")
             return
+        self.push_undo_state("Add box")
         address.boxes.append(
             BoxRecord(
                 pdf_id=self.current_pdf_id,
@@ -952,6 +1263,7 @@ class MainWindow(QMainWindow):
         box_index = next((index for index, box in enumerate(address.boxes) if box.id == box_id), -1)
         if box_index < 0:
             return
+        self.push_undo_state("Delete box")
         del address.boxes[box_index]
         self.refresh_box_list()
         self.render_current_page()
@@ -961,6 +1273,15 @@ class MainWindow(QMainWindow):
         self.refresh_box_list()
         self.autosave_project()
 
+    def on_box_change_started(self, box: BoxRecord) -> None:
+        snapshot = self.make_undo_snapshot("Edit box")
+        snapshot.current_pdf_id = box.pdf_id
+        snapshot.current_page = box.page
+        self.undo_stack.append(snapshot)
+        if len(self.undo_stack) > self.max_undo_states:
+            del self.undo_stack[: len(self.undo_stack) - self.max_undo_states]
+        self.update_actions()
+
     def on_address_type_changed(self, address_type: str) -> None:
         address = self.selected_address()
         if not address:
@@ -968,6 +1289,7 @@ class MainWindow(QMainWindow):
         normalized = normalize_address_type(address_type)
         if address.address_type == normalized:
             return
+        self.push_undo_state("Change address type")
         address.address_type = normalized
         self.refresh_address_list()
         self.autosave_project()
@@ -975,8 +1297,10 @@ class MainWindow(QMainWindow):
     def add_current_page_to_extra_pages(self) -> None:
         if not self.pdf_doc:
             return
-        pages = self.extra_pages.setdefault(self.current_pdf_id, [])
+        pages = self.extra_pages.get(self.current_pdf_id, [])
         if self.current_page not in pages:
+            self.push_undo_state("Add global page")
+            pages = self.extra_pages.setdefault(self.current_pdf_id, [])
             pages.append(self.current_page)
             pages.sort()
             self.refresh_extra_page_list()
@@ -990,6 +1314,7 @@ class MainWindow(QMainWindow):
         data = item.data(Qt.ItemDataRole.UserRole)
         pdf_id = data["pdf_id"]
         page = int(data["page"])
+        self.push_undo_state("Remove global page")
         self.extra_pages[pdf_id] = [extra_page for extra_page in self.extra_pages.get(pdf_id, []) if extra_page != page]
         if not self.extra_pages[pdf_id]:
             del self.extra_pages[pdf_id]
@@ -1009,8 +1334,10 @@ class MainWindow(QMainWindow):
         if not self.pdf_doc:
             return
         address_type = self.selected_type_for_pages()
-        pages = self.type_extra_pages.setdefault(address_type, {}).setdefault(self.current_pdf_id, [])
+        pages = self.type_extra_pages.get(address_type, {}).get(self.current_pdf_id, [])
         if self.current_page not in pages:
+            self.push_undo_state("Add type page")
+            pages = self.type_extra_pages.setdefault(address_type, {}).setdefault(self.current_pdf_id, [])
             pages.append(self.current_page)
             pages.sort()
             self.refresh_type_page_list()
@@ -1026,6 +1353,7 @@ class MainWindow(QMainWindow):
         data = item.data(Qt.ItemDataRole.UserRole)
         pdf_id = data["pdf_id"]
         page = int(data["page"])
+        self.push_undo_state("Remove type page")
         self.type_extra_pages.setdefault(address_type, {})[pdf_id] = [
             type_page for type_page in self.type_extra_pages.get(address_type, {}).get(pdf_id, []) if type_page != page
         ]
@@ -1294,6 +1622,8 @@ class MainWindow(QMainWindow):
         has_pdf = self.pdf_doc is not None
         self.save_action.setEnabled(has_pdf)
         self.export_action.setEnabled(has_pdf)
+        self.replace_pdf_action.setEnabled(has_pdf)
+        self.undo_action.setEnabled(bool(self.undo_stack))
         self.page_spin.setEnabled(has_pdf)
 
     def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt override
